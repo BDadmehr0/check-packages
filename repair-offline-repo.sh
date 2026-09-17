@@ -2,37 +2,29 @@
 set -uo pipefail
 
 # ============================================================
-# Ryoku Offline Repository Package Repair Tool
+# Ryoku Offline Repository Repair Tool
 # ============================================================
 
 REPO="/usr/share/ryoku/offline/repo"
 CACHE="/mnt/var/cache/pacman/pkg"
-OFFLINE="/usr/share/ryoku/offline"
-
+ROOT="/mnt"
+BACKUP_BASE="/usr/share/ryoku/offline"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-WORK="$OFFLINE/repair-$TIMESTAMP"
-BACKUP="$WORK/backup"
-LOG="$WORK/repair.log"
+BACKUP="$BACKUP_BASE/repair-backup-$TIMESTAMP"
+
+LOG="$BACKUP/repair.log"
 
 mkdir -p "$BACKUP"
 
 exec > >(tee -a "$LOG") 2>&1
 
-GOOD=0
-BAD=0
-RECOVERED=0
-FAILED=0
-SKIPPED=0
-
-declare -a BAD_FILES=()
-
 echo "============================================================"
 echo " Ryoku Offline Repository Repair"
 echo "============================================================"
-echo "Repo   : $REPO"
-echo "Cache  : $CACHE"
-echo "Backup : $BACKUP"
-echo "Log    : $LOG"
+echo
+echo "Repository : $REPO"
+echo "Cache      : $CACHE"
+echo "Backup     : $BACKUP"
 echo
 
 # ------------------------------------------------------------
@@ -51,516 +43,534 @@ if [[ ! -d "$REPO" ]]; then
 fi
 
 # ------------------------------------------------------------
-# Dependencies
+# Check required tools
 # ------------------------------------------------------------
 
-for cmd in pacman bsdtar zstd repo-add awk sed grep find sha256sum stat; do
+for cmd in pacman pacman-conf repo-add bsdtar zstd sha256sum; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "ERROR: Required command not found: $cmd"
-        exit 1
+        echo "WARNING: command not found: $cmd"
     fi
 done
 
 # ------------------------------------------------------------
-# Helpers
+# Lock handling
 # ------------------------------------------------------------
 
-package_filename_to_name_version() {
-    local file
-    file="$(basename "$1")"
+LOCK="$REPO/ryoku.db.tar.gz.lck"
 
-    # Remove architecture and extension
-    file="${file%.pkg.tar.zst}"
+if [[ -e "$LOCK" ]]; then
+    echo
+    echo "Checking repository lock..."
 
-    case "$file" in
-        *.any)
-            file="${file%.any}"
-            ;;
-        *_x86_64)
-            file="${file%_x86_64}"
-            ;;
-    esac
+    if pgrep -x pacman >/dev/null || \
+       pgrep -x repo-add >/dev/null; then
 
-    # Arch package format:
-    # name-version-release
-    #
-    # Package names can contain '-' so find the version by
-    # looking for the first segment beginning with a digit.
-
-    local namever="$file"
-    local version=""
-    local name=""
-
-    if [[ "$namever" =~ ^(.+)-([0-9][^-]*)-(.+)$ ]]; then
-        name="${BASH_REMATCH[1]}"
-        version="${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
-    else
-        # More robust fallback:
-        # find "-<digit>" and split there
-        if [[ "$namever" =~ ^(.+)-([0-9].*)$ ]]; then
-            name="${BASH_REMATCH[1]}"
-            version="${BASH_REMATCH[2]}"
-        fi
+        echo "ERROR: pacman/repo-add appears to be running."
+        echo "Do NOT remove the lock."
+        exit 1
     fi
 
-    if [[ -n "$name" && -n "$version" ]]; then
-        printf '%s\n%s\n' "$name" "$version"
+    echo "No pacman/repo-add process detected."
+    echo "Removing stale repository lock."
+
+    mv "$LOCK" "$BACKUP/" 2>/dev/null || rm -f "$LOCK"
+fi
+
+# ------------------------------------------------------------
+# Backup repository
+# ------------------------------------------------------------
+
+echo
+echo "[1/7] Creating repository backup..."
+
+mkdir -p "$BACKUP/repo"
+
+cp -a "$REPO"/. "$BACKUP/repo/"
+
+echo "Backup created."
+
+# ------------------------------------------------------------
+# Verify package using pacman -Qp
+# ------------------------------------------------------------
+
+get_pkg_name() {
+    local file="$1"
+
+    pacman -Qp "$file" 2>/dev/null |
+        awk '{print $1}'
+}
+
+get_pkg_version() {
+    local file="$1"
+
+    pacman -Qp "$file" 2>/dev/null |
+        awk '{print $2}'
+}
+
+# ------------------------------------------------------------
+# Validate package
+# ------------------------------------------------------------
+
+is_good_package() {
+    local file="$1"
+
+    [[ -f "$file" ]] || return 1
+
+    # First: pacman metadata test
+    pacman -Qp "$file" >/dev/null 2>&1 || return 1
+
+    # Second: archive integrity
+    bsdtar -tf "$file" >/dev/null 2>&1 || return 1
+
+    # Third: zstd integrity if available
+    if command -v zstd >/dev/null 2>&1; then
+        zstd -t "$file" >/dev/null 2>&1 || return 1
+    fi
+
+    return 0
+}
+
+# ------------------------------------------------------------
+# Find healthy copies
+# ------------------------------------------------------------
+
+declare -A SEARCH_DIRS
+
+SEARCH_DIRS["repo"]="$REPO"
+SEARCH_DIRS["cache"]="$CACHE"
+SEARCH_DIRS["pacman-cache"]="/var/cache/pacman/pkg"
+SEARCH_DIRS["ryoku-cache"]="/mnt/var/cache/pacman/pkg"
+
+# Additional useful locations
+POSSIBLE_DIRS=(
+    "$REPO"
+    "$CACHE"
+    "/var/cache/pacman/pkg"
+    "/mnt/var/cache/pacman/pkg"
+    "/usr/share/ryoku/offline"
+    "/usr/share/ryoku/offline/packages"
+)
+
+# ------------------------------------------------------------
+# Find exact package by metadata
+# ------------------------------------------------------------
+
+find_replacement() {
+    local bad="$1"
+
+    local pkgname
+    local pkgver
+
+    pkgname="$(get_pkg_name "$bad")"
+    pkgver="$(get_pkg_version "$bad")"
+
+    if [[ -z "$pkgname" || -z "$pkgver" ]]; then
+        echo "ERROR: Cannot read metadata:"
+        echo "$bad"
+        return 1
+    fi
+
+    echo
+    echo "Package:"
+    echo "  $bad"
+    echo
+    echo "Metadata:"
+    echo "  Name    : $pkgname"
+    echo "  Version : $pkgver"
+
+    local dir
+    local candidate
+    local found=""
+
+    for dir in "${POSSIBLE_DIRS[@]}"; do
+
+        [[ -d "$dir" ]] || continue
+
+        while IFS= read -r -d '' candidate; do
+
+            [[ "$candidate" == "$bad" ]] && continue
+
+            echo "Checking candidate:"
+            echo "  $candidate"
+
+            # Metadata must match exactly
+            local cn cv
+
+            cn="$(get_pkg_name "$candidate")"
+            cv="$(get_pkg_version "$candidate")"
+
+            if [[ "$cn" != "$pkgname" ]]; then
+                continue
+            fi
+
+            if [[ "$cv" != "$pkgver" ]]; then
+                continue
+            fi
+
+            echo "  Metadata matches."
+
+            if is_good_package "$candidate"; then
+                echo "  HEALTHY COPY FOUND."
+
+                found="$candidate"
+                break
+            else
+                echo "  Candidate is also corrupted."
+            fi
+
+        done < <(
+            find "$dir" \
+                -maxdepth 2 \
+                -type f \
+                \( -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' -o -name '*.pkg.tar' \) \
+                -print0 2>/dev/null
+        )
+
+        [[ -n "$found" ]] && break
+    done
+
+    if [[ -n "$found" ]]; then
+        printf '%s\n' "$found"
         return 0
     fi
 
     return 1
 }
 
-verify_package() {
-    local file="$1"
-
-    [[ -f "$file" ]] || return 1
-
-    # zstd integrity
-    if ! zstd -t "$file" >/dev/null 2>&1; then
-        return 1
-    fi
-
-    # libalpm metadata/content check
-    if ! bsdtar -tf "$file" >/dev/null 2>&1; then
-        return 1
-    fi
-
-    # Package metadata must be readable
-    if ! bsdtar -xOf "$file" .PKGINFO >/dev/null 2>&1; then
-        return 1
-    fi
-
-    return 0
-}
-
-backup_file() {
-    local file="$1"
-
-    if [[ -f "$file" ]]; then
-        cp -a -- "$file" "$BACKUP/"
-    fi
-}
-
-find_local_copy() {
-    local name="$1"
-    local version="$2"
-    local original="$3"
-
-    local candidate
-    local expected
-
-    expected="${name}-${version}"
-
-    echo "Searching local copies of: $expected"
-
-    # Search cache first
-    while IFS= read -r -d '' candidate; do
-        if verify_package "$candidate"; then
-            echo "  FOUND healthy cache copy:"
-            echo "  $candidate"
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done < <(
-        find "$CACHE" "$OFFLINE" \
-            -type f \
-            -name "${expected}-*.pkg.tar.zst" \
-            -print0 2>/dev/null
-    )
-
-    # Exact filename search
-    while IFS= read -r -d '' candidate; do
-        if [[ "$candidate" != "$original" ]] && verify_package "$candidate"; then
-            echo "  FOUND healthy copy:"
-            echo "  $candidate"
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done < <(
-        find /mnt /usr/share/ryoku \
-            -type f \
-            -name "${expected}-*.pkg.tar.zst" \
-            -print0 2>/dev/null
-    )
-
-    return 1
-}
+# ------------------------------------------------------------
+# Attempt pacman download
+# ------------------------------------------------------------
 
 download_exact_package() {
-    local name="$1"
-    local version="$2"
-    local target="$3"
 
-    local tmpdir
-    tmpdir="$(mktemp -d "$WORK/download.XXXXXX")"
+    local pkgname="$1"
+    local pkgver="$2"
 
-    echo "Trying pacman to download:"
-    echo "  $name = $version"
+    local tmp
+    tmp="$(mktemp -d)"
 
-    # IMPORTANT:
-    # -Sw downloads without installing.
-    # --cachedir directs the package into our temporary directory.
-    #
-    # Try exact version first.
+    echo
+    echo "Trying pacman to obtain exact package:"
+    echo "  $pkgname-$pkgver"
 
+    # Download only. Never install.
     if pacman -Sw \
+        --cachedir "$tmp" \
         --noconfirm \
-        --cachedir "$tmpdir" \
-        "${name}=${version}"; then
+        "$pkgname" >/tmp/ryoku-pacman-download.log 2>&1; then
 
-        local downloaded
-        downloaded="$(find "$tmpdir" -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit)"
+        local candidate
 
-        if [[ -n "$downloaded" ]] && verify_package "$downloaded"; then
-            echo "  Downloaded healthy package:"
-            echo "  $downloaded"
-            printf '%s\n' "$downloaded"
-            rm -rf "$tmpdir"
-            return 0
-        fi
+        while IFS= read -r -d '' candidate; do
+
+            local cn cv
+
+            cn="$(get_pkg_name "$candidate")"
+            cv="$(get_pkg_version "$candidate")"
+
+            if [[ "$cn" == "$pkgname" && "$cv" == "$pkgver" ]]; then
+
+                if is_good_package "$candidate"; then
+                    echo "Downloaded exact healthy package:"
+                    echo "$candidate"
+
+                    echo "$candidate"
+                    return 0
+                fi
+            fi
+
+        done < <(
+            find "$tmp" \
+                -type f \
+                -name '*.pkg.tar.*' \
+                -print0 2>/dev/null
+        )
     fi
 
-    echo "  Exact version download failed."
+    echo "Pacman could not provide exact package."
+    cat /tmp/ryoku-pacman-download.log 2>/dev/null || true
 
-    rm -rf "$tmpdir"
+    rm -rf "$tmp"
+
     return 1
 }
 
+# ------------------------------------------------------------
+# Replace package
+# ------------------------------------------------------------
+
 replace_package() {
+
     local bad="$1"
     local good="$2"
 
+    local filename
+
+    filename="$(basename "$bad")"
+
+    echo
     echo "Replacing:"
     echo "  BAD : $bad"
     echo "  GOOD: $good"
 
-    if ! verify_package "$good"; then
-        echo "ERROR: Replacement failed verification."
-        return 1
+    # Preserve corrupted package
+    mkdir -p "$BACKUP/corrupt"
+
+    mv "$bad" "$BACKUP/corrupt/$filename"
+
+    # Copy healthy package
+    cp -a "$good" "$REPO/$filename"
+
+    # Final validation
+    if is_good_package "$REPO/$filename"; then
+        echo "Replacement verified successfully."
+        return 0
     fi
 
-    backup_file "$bad"
+    echo "ERROR: Replacement failed validation."
 
-    local tmp
-    tmp="${bad}.replacement.$$"
+    # Restore original
+    rm -f "$REPO/$filename"
 
-    if ! cp -a -- "$good" "$tmp"; then
-        rm -f "$tmp"
-        echo "ERROR: Could not copy replacement."
-        return 1
+    if [[ -f "$BACKUP/corrupt/$filename" ]]; then
+        mv "$BACKUP/corrupt/$filename" "$bad"
     fi
 
-    if ! verify_package "$tmp"; then
-        rm -f "$tmp"
-        echo "ERROR: Copied replacement failed verification."
-        return 1
-    fi
-
-    if ! mv -f -- "$tmp" "$bad"; then
-        rm -f "$tmp"
-        echo "ERROR: Could not replace original."
-        return 1
-    fi
-
-    echo "  Replacement successful."
-    return 0
+    return 1
 }
 
 # ------------------------------------------------------------
-# Phase 1: Scan repository
+# Scan repository
 # ------------------------------------------------------------
 
 echo
-echo "[1/6] Scanning repository..."
-echo
+echo "[2/7] Scanning repository..."
 
-mapfile -d '' ALL_PACKAGES < <(
-    find "$REPO" -maxdepth 1 -type f \
-        -name '*.pkg.tar.zst' \
-        -print0 | sort -z
-)
+GOOD=0
+BAD=0
 
-TOTAL=${#ALL_PACKAGES[@]}
+BAD_LIST="$BACKUP/bad-packages.txt"
+GOOD_LIST="$BACKUP/good-packages.txt"
 
-echo "Packages found: $TOTAL"
-echo
+: > "$BAD_LIST"
+: > "$GOOD_LIST"
 
-for pkg in "${ALL_PACKAGES[@]}"; do
-    printf '\rChecking: %d / %d' "$((GOOD + BAD + 1))" "$TOTAL"
+while IFS= read -r -d '' pkg; do
 
-    if verify_package "$pkg"; then
+    if is_good_package "$pkg"; then
+        echo "GOOD: $pkg"
+        echo "$pkg" >> "$GOOD_LIST"
         ((GOOD++))
     else
+        echo "BAD : $pkg"
+        echo "$pkg" >> "$BAD_LIST"
         ((BAD++))
-        BAD_FILES+=("$pkg")
     fi
-done
+
+done < <(
+    find "$REPO" \
+        -maxdepth 1 \
+        -type f \
+        -name '*.pkg.tar.zst' \
+        -print0
+)
 
 echo
-echo
-echo "Initial scan:"
-echo "  Good : $GOOD"
-echo "  Bad  : $BAD"
-echo
-
-if (( BAD == 0 )); then
-    echo "No corrupted packages found."
-    exit 0
-fi
+echo "Initial state:"
+echo "  Good: $GOOD"
+echo "  Bad : $BAD"
 
 # ------------------------------------------------------------
-# Phase 2: Save bad package list
+# Repair
 # ------------------------------------------------------------
 
-BAD_LIST="$WORK/bad-packages.txt"
-
-printf '%s\n' "${BAD_FILES[@]}" > "$BAD_LIST"
-
-echo "[2/6] Bad packages saved to:"
-echo "$BAD_LIST"
 echo
+echo "[3/7] Repairing corrupted packages..."
 
-# ------------------------------------------------------------
-# Phase 3: Repair
-# ------------------------------------------------------------
+RECOVERED=0
+FAILED=0
 
-echo "[3/6] Repairing packages..."
-echo
+while IFS= read -r bad; do
 
-for bad in "${BAD_FILES[@]}"; do
+    [[ -z "$bad" ]] && continue
+    [[ -f "$bad" ]] || continue
 
     echo
     echo "------------------------------------------------------------"
-    echo "Package:"
-    echo "$bad"
-    echo "------------------------------------------------------------"
 
-    filename_data="$(package_filename_to_name_version "$bad" 2>/dev/null || true)"
+    pkgname="$(get_pkg_name "$bad")"
+    pkgver="$(get_pkg_version "$bad")"
 
-    if [[ -z "$filename_data" ]]; then
-        echo "FAILED: Cannot determine package name/version."
-        ((FAILED++))
-        continue
+    if [[ -z "$pkgname" || -z "$pkgver" ]]; then
+        echo "Cannot read package metadata."
+        echo "Trying filename fallback."
+
+        filename="$(basename "$bad")"
+
+        # Remove .pkg.tar.zst
+        base="${filename%.pkg.tar.zst}"
+
+        # Arch package filenames are:
+        # name-version-arch
+        #
+        # Instead of manually splitting version,
+        # search all local packages and compare filename metadata.
+        pkgname=""
+        pkgver=""
+    else
+        echo "Detected:"
+        echo "  Name    : $pkgname"
+        echo "  Version : $pkgver"
     fi
-
-    name="$(echo "$filename_data" | sed -n '1p')"
-    version="$(echo "$filename_data" | sed -n '2p')"
-
-    echo "Detected:"
-    echo "  Name   : $name"
-    echo "  Version: $version"
 
     replacement=""
 
-    # --------------------------------------------------------
-    # Search healthy local copy
-    # --------------------------------------------------------
+    if [[ -n "$pkgname" && -n "$pkgver" ]]; then
 
-    replacement="$(
-        find_local_copy "$name" "$version" "$bad" 2>/dev/null \
-        | tail -n 1
-    )" || replacement=""
+        replacement="$(find_replacement "$bad" 2>/dev/null | tail -n 1)" || true
 
-    # --------------------------------------------------------
-    # Download if local copy unavailable
-    # --------------------------------------------------------
-
-    if [[ -z "$replacement" ]]; then
-        replacement="$(
-            download_exact_package "$name" "$version" "$bad" 2>/dev/null \
-            | tail -n 1
-        )" || replacement=""
     fi
 
     # --------------------------------------------------------
-    # Final check
+    # If no local copy: download exact package
     # --------------------------------------------------------
 
-    if [[ -z "$replacement" || ! -f "$replacement" ]]; then
-        echo "FAILED: No healthy replacement available."
-        echo
-        ((FAILED++))
-        continue
-    fi
+    if [[ -z "$replacement" && -n "$pkgname" && -n "$pkgver" ]]; then
 
-    if ! verify_package "$replacement"; then
-        echo "FAILED: Replacement is not healthy."
-        ((FAILED++))
-        continue
+        replacement="$(download_exact_package "$pkgname" "$pkgver" 2>/dev/null | tail -n 1)" || true
+
     fi
 
     # --------------------------------------------------------
     # Replace
     # --------------------------------------------------------
 
-    if replace_package "$bad" "$replacement"; then
-        ((RECOVERED++))
+    if [[ -n "$replacement" && -f "$replacement" ]]; then
+
+        if replace_package "$bad" "$replacement"; then
+            ((RECOVERED++))
+        else
+            ((FAILED++))
+        fi
+
     else
+
+        echo
+        echo "FAILED: No healthy replacement available."
+        echo "Original package was NOT touched."
+
         ((FAILED++))
     fi
 
-done
+done < "$BAD_LIST"
+
+echo
+echo "Repair phase complete."
+echo "Recovered: $RECOVERED"
+echo "Failed   : $FAILED"
 
 # ------------------------------------------------------------
-# Phase 4: Rescan
+# Re-scan
 # ------------------------------------------------------------
 
 echo
-echo "[4/6] Rechecking repaired repository..."
-echo
+echo "[4/7] Rechecking repository..."
 
 FINAL_GOOD=0
 FINAL_BAD=0
 
+FINAL_BAD_LIST="$BACKUP/final-bad-packages.txt"
+
+: > "$FINAL_BAD_LIST"
+
 while IFS= read -r -d '' pkg; do
-    if verify_package "$pkg"; then
+
+    if is_good_package "$pkg"; then
         ((FINAL_GOOD++))
     else
-        ((FINAL_BAD++))
         echo "STILL BAD:"
         echo "$pkg"
+
+        echo "$pkg" >> "$FINAL_BAD_LIST"
+
+        ((FINAL_BAD++))
     fi
+
 done < <(
-    find "$REPO" -maxdepth 1 -type f \
+    find "$REPO" \
+        -maxdepth 1 \
+        -type f \
         -name '*.pkg.tar.zst' \
-        -print0 | sort -z
+        -print0
 )
 
-echo
-echo "Final package state:"
-echo "  Good: $FINAL_GOOD"
-echo "  Bad : $FINAL_BAD"
-echo
-
 # ------------------------------------------------------------
-# Phase 5: Lock detection
+# Repository database
 # ------------------------------------------------------------
 
-echo "[5/6] Checking repository database lock..."
-
-DB="$REPO/ryoku.db.tar.gz"
-LOCK="${DB}.lck"
+echo
+echo "[5/7] Checking repository database lock..."
 
 if [[ -e "$LOCK" ]]; then
 
-    echo
-    echo "WARNING: Lock exists:"
-    echo "$LOCK"
+    if pgrep -x pacman >/dev/null || \
+       pgrep -x repo-add >/dev/null; then
 
-    # Check whether repo-add/pacman is actually running.
-    if pgrep -a -f '(^|/)(repo-add|pacman)( |$)' >/dev/null 2>&1; then
-        echo
-        echo "A pacman/repo-add process appears to be running."
-        echo "The lock will NOT be removed automatically."
-        echo
-        echo "Processes:"
-        pgrep -a -f '(^|/)(repo-add|pacman)( |$)' || true
-
-        echo
-        echo "Repository database rebuild SKIPPED."
-        ((SKIPPED++))
-
-    else
-        echo
-        echo "No pacman/repo-add process appears to be running."
-        echo "The lock appears stale."
-
-        # Backup lock rather than blindly deleting it.
-        mkdir -p "$BACKUP/locks"
-
-        cp -a "$LOCK" "$BACKUP/locks/" 2>/dev/null || true
-        rm -f "$LOCK"
-
-        echo "Stale lock moved/removed."
+        echo "ERROR: repository is currently locked."
+        echo "Database will NOT be rebuilt."
+        exit 1
     fi
+
+    echo "Removing stale lock."
+    mv "$LOCK" "$BACKUP/" 2>/dev/null || rm -f "$LOCK"
 fi
 
 # ------------------------------------------------------------
-# Phase 6: Rebuild repo database
+# Rebuild database ONLY if all packages are healthy
 # ------------------------------------------------------------
 
-if (( FINAL_BAD > 0 )); then
-    echo
-    echo "WARNING:"
-    echo "$FINAL_BAD package(s) are still corrupted."
-    echo "Repository database will NOT be rebuilt."
-    echo "Fix remaining packages first."
-    ((SKIPPED++))
-else
+if [[ "$FINAL_BAD" -eq 0 ]]; then
 
     echo
-    echo "[6/6] Rebuilding repository database..."
-    echo
+    echo "[6/7] Rebuilding repository database..."
 
-    # Backup current database files.
-    mkdir -p "$BACKUP/repo-db"
-
-    for dbfile in \
-        "$REPO/ryoku.db.tar.gz" \
-        "$REPO/ryoku.files.tar.gz" \
+    # Remove old database files
+    rm -f \
         "$REPO/ryoku.db" \
-        "$REPO/ryoku.files"; do
+        "$REPO/ryoku.db.tar.gz" \
+        "$REPO/ryoku.files" \
+        "$REPO/ryoku.files.tar.gz"
 
-        if [[ -e "$dbfile" ]]; then
-            cp -a "$dbfile" "$BACKUP/repo-db/" 2>/dev/null || true
-        fi
-    done
+    repo-add \
+        "$REPO/ryoku.db.tar.gz" \
+        "$REPO"/*.pkg.tar.zst
 
-    echo "Running repo-add..."
-
-    if repo-add --remove "$DB" "$REPO"/*.pkg.tar.zst; then
+    if [[ $? -eq 0 ]]; then
         echo
         echo "Repository database rebuilt successfully."
     else
         echo
         echo "ERROR: repo-add failed."
-        echo
-        echo "Repository package files were NOT deleted."
-        echo "Previous database backup is available at:"
-        echo "$BACKUP/repo-db"
-        ((FAILED++))
+        echo "Backup:"
+        echo "$BACKUP/repo"
+        exit 1
     fi
+
+else
+
+    echo
+    echo "WARNING:"
+    echo "$FINAL_BAD package(s) are still corrupted."
+
+    echo "Repository database will NOT be rebuilt."
 fi
 
 # ------------------------------------------------------------
 # Final report
 # ------------------------------------------------------------
 
-REPORT="$WORK/REPORT.txt"
-
-cat > "$REPORT" <<EOF
-Ryoku Offline Repository Repair Report
-======================================
-
-Date:
-$TIMESTAMP
-
-Repository:
-$REPO
-
-Initial:
-  Good: $GOOD
-  Bad : $BAD
-
-Repair:
-  Recovered: $RECOVERED
-  Failed   : $FAILED
-  Skipped  : $SKIPPED
-
-Final:
-  Good: $FINAL_GOOD
-  Bad : $FINAL_BAD
-
-Backup:
-$BACKUP
-
-Bad package list:
-$BAD_LIST
-
-Log:
-$LOG
-EOF
+echo
+echo "[7/7] Final report"
 
 echo
 echo "============================================================"
@@ -574,18 +584,17 @@ echo
 echo "Repair:"
 echo "  Recovered: $RECOVERED"
 echo "  Failed   : $FAILED"
-echo "  Skipped  : $SKIPPED"
 echo
 echo "Final:"
 echo "  Good : $FINAL_GOOD"
 echo "  Bad  : $FINAL_BAD"
 echo
 echo "Backup:"
-echo "$BACKUP"
+echo "  $BACKUP"
 echo
-echo "Report:"
-echo "$REPORT"
+echo "Bad package list:"
+echo "  $FINAL_BAD_LIST"
 echo
 echo "Log:"
-echo "$LOG"
-echo "============================================================"
+echo "  $LOG"
+echo
